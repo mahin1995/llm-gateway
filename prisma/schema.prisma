@@ -1,0 +1,192 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Tier {
+  L1
+  L2
+  L3
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum ApiKeyStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum RequestStatus {
+  SUCCESS
+  REJECTED
+  FAILED
+}
+
+enum ErrorCategory {
+  NONE
+  AUTH
+  POLICY
+  TOKEN_LIMIT
+  PROVIDER
+  INVALID_OUTPUT
+  QUALITY
+}
+
+model User {
+  id          String          @id @default(cuid())
+  email       String          @unique
+  name        String
+  passwordHash String?
+  isAdmin     Boolean         @default(false)
+  status      UserStatus      @default(ACTIVE)
+  packageId   String?
+  package     Package?        @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  apiKeys     ApiKey[]
+  policy      UserModelPolicy?
+  requestLogs RequestLog[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+model ApiKey {
+  id         String       @id @default(cuid())
+  name       String
+  keyHash    String       @unique
+  status     ApiKeyStatus @default(ACTIVE)
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastUsedAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+}
+
+model Provider {
+  id           String        @id @default(cuid())
+  name         String        @unique
+  baseUrl      String
+  apiKeyEnvVar String
+  active       Boolean       @default(true)
+  models       ModelConfig[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model ModelConfig {
+  id               String            @id @default(cuid())
+  providerId       String
+  provider         Provider          @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  modelName        String
+  displayName      String
+  tier             Tier
+  maxContextTokens Int
+  maxOutputTokens  Int
+  inputCostPer1M   Decimal?          @db.Decimal(10, 4)
+  outputCostPer1M  Decimal?          @db.Decimal(10, 4)
+  active           Boolean           @default(true)
+  l1Policies       UserModelPolicy[] @relation("PolicyL1Model")
+  l2Policies       UserModelPolicy[] @relation("PolicyL2Model")
+  l3Policies       UserModelPolicy[] @relation("PolicyL3Model")
+  l1Packages       Package[]         @relation("PackageL1Model")
+  l2Packages       Package[]         @relation("PackageL2Model")
+  l3Packages       Package[]         @relation("PackageL3Model")
+  requestLogs      RequestLog[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@unique([providerId, modelName])
+}
+
+model OpenRouterModel {
+  id                String   @id @default(cuid())
+  modelId           String   @unique
+  name              String?
+  description       String?  @db.Text
+  contextLength     Int?
+  inputCostPer1M    Decimal? @db.Decimal(18, 8)
+  outputCostPer1M   Decimal? @db.Decimal(18, 8)
+  tokenizer         String?
+  modality          String?
+  openRouterCreatedAt DateTime?
+  raw               Json
+  syncedAt          DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model Package {
+  id              String      @id @default(cuid())
+  name            String      @unique
+  description     String?
+  maxTier         Tier        @default(L1)
+  maxInputTokens  Int
+  maxOutputTokens Int
+  maxRagTokens    Int
+  truncateInput   Boolean     @default(false)
+  cacheEnabled    Boolean     @default(false)
+  ragEnabled      Boolean     @default(false)
+  active          Boolean     @default(true)
+  l1ModelId       String
+  l1Model         ModelConfig @relation("PackageL1Model", fields: [l1ModelId], references: [id])
+  l2ModelId       String?
+  l2Model         ModelConfig? @relation("PackageL2Model", fields: [l2ModelId], references: [id])
+  l3ModelId       String?
+  l3Model         ModelConfig? @relation("PackageL3Model", fields: [l3ModelId], references: [id])
+  users           User[]
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+}
+
+model UserModelPolicy {
+  id             String      @id @default(cuid())
+  userId         String      @unique
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  maxTier        Tier        @default(L1)
+  maxInputTokens Int
+  maxOutputTokens Int
+  maxRagTokens   Int
+  truncateInput  Boolean     @default(false)
+  cacheEnabled   Boolean     @default(false)
+  ragEnabled     Boolean     @default(false)
+  l1ModelId      String
+  l1Model        ModelConfig @relation("PolicyL1Model", fields: [l1ModelId], references: [id])
+  l2ModelId      String?
+  l2Model        ModelConfig? @relation("PolicyL2Model", fields: [l2ModelId], references: [id])
+  l3ModelId      String?
+  l3Model        ModelConfig? @relation("PolicyL3Model", fields: [l3ModelId], references: [id])
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
+
+model RequestLog {
+  id                   String        @id @default(cuid())
+  userId               String?
+  user                 User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  modelConfigId        String?
+  modelConfig          ModelConfig?  @relation(fields: [modelConfigId], references: [id], onDelete: SetNull)
+  status               RequestStatus
+  requestedTier        Tier?
+  selectedTier         Tier?
+  selectedModel        String?
+  promptText           String?       @db.Text
+  promptPreview        String?
+  inputTokensEstimated Int           @default(0)
+  outputTokensLimit    Int           @default(0)
+  providerInputTokens  Int?
+  providerOutputTokens Int?
+  providerTotalTokens  Int?
+  providerCachedTokens Int?
+  providerReasoningTokens Int?
+  providerCost         Decimal?      @db.Decimal(12, 6)
+  providerRawUsage     Json?
+  escalationAttempts   Int           @default(0)
+  errorCategory        ErrorCategory @default(NONE)
+  errorMessage         String?
+  createdAt            DateTime      @default(now())
+}
