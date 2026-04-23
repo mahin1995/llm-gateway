@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import path from "node:path";
 import { config } from "./config.js";
+import { logInfo } from "./lib/logger.js";
 import { authenticateGatewayKey, authenticateSession } from "./middleware/auth.js";
 import { requireAdmin } from "./middleware/admin.js";
 import { accountRouter } from "./routes/account.js";
@@ -18,6 +19,24 @@ export function createApp(): express.Express {
   app.use(cors({
     origin: config.NODE_ENV === "production" ? false : config.CLIENT_DEV_ORIGIN
   }));
+  app.use((req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+
+    res.on("finish", () => {
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+
+      logInfo("http", "request completed", {
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        durationMs: Number(durationMs.toFixed(1)),
+        userId: req.gateway?.user.id,
+        apiKeyId: req.gateway?.apiKeyId
+      });
+    });
+
+    next();
+  });
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/api/health", (_req, res) => {

@@ -59,6 +59,14 @@ textarea {
   padding: 0.8rem;
 }
 
+input:disabled,
+select:disabled,
+textarea:disabled {
+  background: #f1f4ee;
+  color: #687068;
+  cursor: not-allowed;
+}
+
 textarea {
   resize: vertical;
 }
@@ -196,9 +204,50 @@ pre {
   gap: 0.75rem;
 }
 
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.pagination {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+}
+
+.pagination span {
+  color: #687068;
+  font-weight: 700;
+}
+
+.table-header-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.icon-button {
+  align-items: center;
+  display: inline-flex;
+  gap: 0.35rem;
+}
+
+.icon-button svg {
+  fill: currentColor;
+  height: 1rem;
+  width: 1rem;
+}
+
 .stack {
   display: grid;
   gap: 1.25rem;
+}
+
+.stack.tight {
+  gap: 0.5rem;
 }
 
 .intro-band {
@@ -241,11 +290,17 @@ pre {
 }
 
 .key-panel label,
-.tool-panel label {
+.tool-panel label,
+.data-band label,
+.admin-card label:not(.checkbox-row) {
   display: grid;
   gap: 0.4rem;
   color: #424941;
   font-weight: 700;
+}
+
+.inline-form button {
+  align-self: end;
 }
 
 .key-row {
@@ -339,7 +394,8 @@ pre {
 }
 
 .form-grid,
-.metrics-grid {
+.metrics-grid,
+.filter-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
@@ -373,6 +429,122 @@ pre {
 
 .admin-card h3 {
   margin: 0;
+}
+
+.modal-backdrop {
+  align-items: start;
+  background: rgba(28, 31, 27, 0.42);
+  display: grid;
+  inset: 0;
+  justify-items: center;
+  overflow: auto;
+  padding: 2rem 1rem;
+  position: fixed;
+  z-index: 20;
+}
+
+.modal-panel {
+  background: #fff;
+  border: 1px solid #d8ded5;
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(28, 31, 27, 0.18);
+  display: grid;
+  gap: 1rem;
+  max-width: 760px;
+  padding: 1rem;
+  width: min(760px, 100%);
+}
+
+.modal-header {
+  align-items: start;
+  border-bottom: 1px solid #dfe4dc;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  padding-bottom: 0.75rem;
+}
+
+.modal-header h2 {
+  margin: 0;
+}
+
+.modal-form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.modal-form label:not(.checkbox-row) {
+  color: #424941;
+  display: grid;
+  font-weight: 700;
+  gap: 0.4rem;
+}
+
+.filter-grid label {
+  color: #424941;
+  display: grid;
+  font-weight: 700;
+  gap: 0.4rem;
+}
+
+.combo-field {
+  display: grid;
+  gap: 0.4rem;
+  position: relative;
+}
+
+.combo-field label {
+  color: #424941;
+  font-weight: 700;
+}
+
+.combo-menu {
+  background: #fff;
+  border: 1px solid #c7cec6;
+  border-radius: 8px;
+  box-shadow: 0 14px 36px rgba(28, 31, 27, 0.14);
+  display: grid;
+  left: 0;
+  max-height: 280px;
+  overflow: auto;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.25rem);
+  z-index: 30;
+}
+
+.combo-option {
+  background: #fff;
+  border-bottom: 1px solid #edf1ea;
+  border-radius: 0;
+  color: #263128;
+  display: grid;
+  gap: 0.15rem;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+}
+
+.combo-option:hover,
+.combo-option:focus {
+  background: #effaf2;
+}
+
+.combo-option span,
+.combo-empty {
+  color: #687068;
+  font-size: 0.85rem;
+}
+
+.combo-empty {
+  padding: 0.7rem 0.75rem;
+}
+
+.modal-actions {
+  border-top: 1px solid #dfe4dc;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+  padding-top: 0.75rem;
 }
 
 .checkbox-row {
@@ -536,14 +708,20 @@ pre {
   .key-row,
   .inline-form,
   .form-grid,
+  .filter-grid,
   .metrics-grid,
   .metrics-grid.compact,
-  .header-actions {
+  .header-actions,
+  .modal-actions {
     grid-template-columns: 1fr;
   }
 
   .header-actions {
     align-items: stretch;
+    display: grid;
+  }
+
+  .modal-actions {
     display: grid;
   }
 

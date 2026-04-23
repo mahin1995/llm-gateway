@@ -14,20 +14,31 @@ import {
 
 export const adminRouter = Router();
 
+const packageAliasSchema = z.object({
+  alias: z.string().trim().min(1).max(80),
+  modelConfigId: z.string().min(1),
+  enableOpenAI: z.boolean().default(true),
+  enableAnthropic: z.boolean().default(true),
+  active: z.boolean().default(true)
+});
+
+const packageTokenLimitSchema = z.number().int().nonnegative().nullable().transform((value) => value ?? 0);
+
 const packageSchema = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().trim().max(240).optional().nullable(),
   maxTier: z.nativeEnum(Tier),
-  maxInputTokens: z.number().int().positive(),
-  maxOutputTokens: z.number().int().positive(),
-  maxRagTokens: z.number().int().min(0),
+  maxInputTokens: packageTokenLimitSchema,
+  maxOutputTokens: packageTokenLimitSchema,
+  maxRagTokens: packageTokenLimitSchema,
   truncateInput: z.boolean().default(false),
   cacheEnabled: z.boolean().default(false),
   ragEnabled: z.boolean().default(false),
   active: z.boolean().default(true),
   l1ModelId: z.string().min(1),
   l2ModelId: z.string().min(1).optional().nullable(),
-  l3ModelId: z.string().min(1).optional().nullable()
+  l3ModelId: z.string().min(1).optional().nullable(),
+  aliases: z.array(packageAliasSchema).default([])
 });
 
 const createUserSchema = z.object({
@@ -53,6 +64,12 @@ const modelSchema = z.object({
   tier: z.nativeEnum(Tier),
   maxContextTokens: z.number().int().positive(),
   maxOutputTokens: z.number().int().positive(),
+  inputCostPer1M: z.number().nonnegative().optional().nullable(),
+  outputCostPer1M: z.number().nonnegative().optional().nullable(),
+  supportsOpenAIChat: z.boolean().default(true),
+  supportsAnthropicMessages: z.boolean().default(true),
+  supportsTools: z.boolean().default(true),
+  supportsStreaming: z.boolean().default(true),
   active: z.boolean().default(true)
 });
 
@@ -84,7 +101,7 @@ adminRouter.get("/dashboard", async (_req, res) => {
         orderBy: { createdAt: "desc" }
       }),
       prisma.provider.findMany({
-        include: { models: { orderBy: [{ tier: "asc" }, { displayName: "asc" }] } },
+        include: { models: { orderBy: [{ displayName: "asc" }] } },
         orderBy: { name: "asc" }
       }),
       prisma.package.findMany({
@@ -92,6 +109,10 @@ adminRouter.get("/dashboard", async (_req, res) => {
           l1Model: true,
           l2Model: true,
           l3Model: true,
+          aliases: {
+            include: { modelConfig: true },
+            orderBy: { alias: "asc" }
+          },
           _count: { select: { users: true } }
         },
         orderBy: { createdAt: "desc" }
@@ -126,12 +147,18 @@ adminRouter.get("/dashboard", async (_req, res) => {
           active: provider.active,
           models: provider.models.map((model) => ({
             id: model.id,
+            providerId: model.providerId,
             displayName: model.displayName,
             modelName: model.modelName,
-            tier: model.tier,
             active: model.active,
             maxContextTokens: model.maxContextTokens,
-            maxOutputTokens: model.maxOutputTokens
+            maxOutputTokens: model.maxOutputTokens,
+            inputCostPer1M: model.inputCostPer1M?.toString() ?? null,
+            outputCostPer1M: model.outputCostPer1M?.toString() ?? null,
+            supportsOpenAIChat: model.supportsOpenAIChat,
+            supportsAnthropicMessages: model.supportsAnthropicMessages,
+            supportsTools: model.supportsTools,
+            supportsStreaming: model.supportsStreaming
           }))
         })),
         packages: packages.map((pkg) => ({
@@ -154,6 +181,7 @@ adminRouter.get("/dashboard", async (_req, res) => {
             L2: pkg.l2Model?.displayName ?? null,
             L3: pkg.l3Model?.displayName ?? null
           },
+          aliases: pkg.aliases.map((alias) => serializePackageAlias(alias)),
           userCount: pkg._count.users
         })),
         requestLogs
@@ -216,13 +244,13 @@ adminRouter.post("/packages", async (req, res) => {
   try {
     const payload = packageSchema.parse(req.body);
     await validatePackageModels(payload);
-
     const pkg = await prisma.package.create({
-      data: {
-        ...payload,
-        description: payload.description || null,
-        l2ModelId: payload.l2ModelId || null,
-        l3ModelId: payload.l3ModelId || null
+      data: packageWriteData(payload),
+      include: {
+        aliases: {
+          include: { modelConfig: true },
+          orderBy: { alias: "asc" }
+        }
       }
     });
 
@@ -245,19 +273,23 @@ adminRouter.patch("/packages/:id", async (req, res) => {
       ...existing,
       ...payload,
       l2ModelId: payload.l2ModelId === undefined ? existing.l2ModelId : payload.l2ModelId || null,
-      l3ModelId: payload.l3ModelId === undefined ? existing.l3ModelId : payload.l3ModelId || null
+      l3ModelId: payload.l3ModelId === undefined ? existing.l3ModelId : payload.l3ModelId || null,
+      aliases: payload.aliases ?? undefined
     };
     await validatePackageModels(merged);
 
     const pkg = await prisma.package.update({
       where: { id: req.params.id },
-      data: {
-        ...payload,
-        description: payload.description === undefined ? undefined : payload.description || null,
-        l2ModelId: payload.l2ModelId === undefined ? undefined : payload.l2ModelId || null,
-        l3ModelId: payload.l3ModelId === undefined ? undefined : payload.l3ModelId || null
+      data: packageUpdateData(payload),
+      include: {
+        aliases: {
+          include: { modelConfig: true },
+          orderBy: { alias: "asc" }
+        }
       }
     });
+
+    await syncPackagePoliciesForAssignedUsers(pkg);
 
     res.json({ data: { package: pkg } });
   } catch (error) {
@@ -374,7 +406,8 @@ function summarizePolicy(policy: {
       L1: policy.l1Model.displayName,
       L2: policy.l2Model?.displayName ?? null,
       L3: policy.l3Model?.displayName ?? null
-    }
+    },
+    aliases: []
   };
 }
 
@@ -410,6 +443,27 @@ function serializeOpenRouterModel(model: {
   };
 }
 
+function serializePackageAlias(alias: {
+  id: string;
+  alias: string;
+  modelConfigId: string;
+  enableOpenAI: boolean;
+  enableAnthropic: boolean;
+  active: boolean;
+  modelConfig: { displayName: string; modelName: string };
+}) {
+  return {
+    id: alias.id,
+    alias: alias.alias,
+    modelConfigId: alias.modelConfigId,
+    modelDisplayName: alias.modelConfig.displayName,
+    modelName: alias.modelConfig.modelName,
+    enableOpenAI: alias.enableOpenAI,
+    enableAnthropic: alias.enableAnthropic,
+    active: alias.active
+  };
+}
+
 async function getPackageOrThrow(packageId: string) {
   const pkg = await prisma.package.findUnique({ where: { id: packageId } });
 
@@ -427,30 +481,129 @@ async function applyPackageToUser(userId: string, packageId: string): Promise<vo
     where: { userId },
     create: {
       userId,
-      maxTier: pkg.maxTier,
-      maxInputTokens: pkg.maxInputTokens,
-      maxOutputTokens: pkg.maxOutputTokens,
-      maxRagTokens: pkg.maxRagTokens,
-      truncateInput: pkg.truncateInput,
-      cacheEnabled: pkg.cacheEnabled,
-      ragEnabled: pkg.ragEnabled,
-      l1ModelId: pkg.l1ModelId,
-      l2ModelId: pkg.l2ModelId,
-      l3ModelId: pkg.l3ModelId
+      ...packagePolicyData(pkg)
     },
     update: {
-      maxTier: pkg.maxTier,
-      maxInputTokens: pkg.maxInputTokens,
-      maxOutputTokens: pkg.maxOutputTokens,
-      maxRagTokens: pkg.maxRagTokens,
-      truncateInput: pkg.truncateInput,
-      cacheEnabled: pkg.cacheEnabled,
-      ragEnabled: pkg.ragEnabled,
-      l1ModelId: pkg.l1ModelId,
-      l2ModelId: pkg.l2ModelId,
-      l3ModelId: pkg.l3ModelId
+      ...packagePolicyData(pkg)
     }
   });
+}
+
+async function syncPackagePoliciesForAssignedUsers(pkg: {
+  id: string;
+  maxTier: Tier;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxRagTokens: number;
+  truncateInput: boolean;
+  cacheEnabled: boolean;
+  ragEnabled: boolean;
+  l1ModelId: string;
+  l2ModelId: string | null;
+  l3ModelId: string | null;
+}): Promise<void> {
+  const users = await prisma.user.findMany({
+    where: { packageId: pkg.id },
+    select: { id: true }
+  });
+
+  if (users.length === 0) {
+    return;
+  }
+
+  const data = packagePolicyData(pkg);
+
+  await prisma.$transaction(
+    users.map((user) => prisma.userModelPolicy.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+        ...data
+      },
+      update: data
+    }))
+  );
+}
+
+function packagePolicyData(pkg: {
+  maxTier: Tier;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxRagTokens: number;
+  truncateInput: boolean;
+  cacheEnabled: boolean;
+  ragEnabled: boolean;
+  l1ModelId: string;
+  l2ModelId: string | null;
+  l3ModelId: string | null;
+}) {
+  return {
+    maxTier: pkg.maxTier,
+    maxInputTokens: pkg.maxInputTokens,
+    maxOutputTokens: pkg.maxOutputTokens,
+    maxRagTokens: pkg.maxRagTokens,
+    truncateInput: pkg.truncateInput,
+    cacheEnabled: pkg.cacheEnabled,
+    ragEnabled: pkg.ragEnabled,
+    l1ModelId: pkg.l1ModelId,
+    l2ModelId: pkg.l2ModelId,
+    l3ModelId: pkg.l3ModelId
+  };
+}
+
+function packageWriteData(payload: z.infer<typeof packageSchema>) {
+  return {
+    name: payload.name,
+    description: payload.description || null,
+    maxTier: payload.maxTier,
+    maxInputTokens: payload.maxInputTokens,
+    maxOutputTokens: payload.maxOutputTokens,
+    maxRagTokens: payload.maxRagTokens,
+    truncateInput: payload.truncateInput,
+    cacheEnabled: payload.cacheEnabled,
+    ragEnabled: payload.ragEnabled,
+    active: payload.active,
+    l1ModelId: payload.l1ModelId,
+    l2ModelId: payload.l2ModelId || null,
+    l3ModelId: payload.l3ModelId || null,
+    aliases: {
+      create: payload.aliases.map((alias) => ({
+        alias: alias.alias.trim().toLowerCase(),
+        modelConfigId: alias.modelConfigId,
+        enableOpenAI: alias.enableOpenAI,
+        enableAnthropic: alias.enableAnthropic,
+        active: alias.active
+      }))
+    }
+  };
+}
+
+function packageUpdateData(payload: Partial<z.infer<typeof packageSchema>>) {
+  return {
+    name: payload.name,
+    description: payload.description === undefined ? undefined : payload.description || null,
+    maxTier: payload.maxTier,
+    maxInputTokens: payload.maxInputTokens,
+    maxOutputTokens: payload.maxOutputTokens,
+    maxRagTokens: payload.maxRagTokens,
+    truncateInput: payload.truncateInput,
+    cacheEnabled: payload.cacheEnabled,
+    ragEnabled: payload.ragEnabled,
+    active: payload.active,
+    l1ModelId: payload.l1ModelId,
+    l2ModelId: payload.l2ModelId === undefined ? undefined : payload.l2ModelId || null,
+    l3ModelId: payload.l3ModelId === undefined ? undefined : payload.l3ModelId || null,
+    aliases: payload.aliases === undefined ? undefined : {
+      deleteMany: {},
+      create: payload.aliases.map((alias) => ({
+        alias: alias.alias.trim().toLowerCase(),
+        modelConfigId: alias.modelConfigId,
+        enableOpenAI: alias.enableOpenAI,
+        enableAnthropic: alias.enableAnthropic,
+        active: alias.active
+      }))
+    }
+  };
 }
 
 async function validatePackageModels(payload: {
@@ -458,6 +611,7 @@ async function validatePackageModels(payload: {
   l1ModelId: string;
   l2ModelId?: string | null;
   l3ModelId?: string | null;
+  aliases?: Array<z.infer<typeof packageAliasSchema>>;
 }): Promise<void> {
   if (payload.maxTier !== Tier.L1 && !payload.l2ModelId) {
     throw new HttpError(400, "L2 model is required for L2/L3 packages", "package_model_required");
@@ -467,16 +621,32 @@ async function validatePackageModels(payload: {
     throw new HttpError(400, "L3 model is required for L3 packages", "package_model_required");
   }
 
-  const modelIds = [payload.l1ModelId, payload.l2ModelId, payload.l3ModelId].filter(Boolean) as string[];
-  const count = await prisma.modelConfig.count({
+  const requiredModelIds = [
+    payload.l1ModelId,
+    payload.l2ModelId ?? null,
+    payload.l3ModelId ?? null
+  ].filter((modelId): modelId is string => Boolean(modelId));
+
+  const models = await prisma.modelConfig.findMany({
     where: {
-      id: { in: modelIds },
+      id: { in: requiredModelIds },
       active: true
+    },
+    select: {
+      id: true
     }
   });
 
-  if (count !== modelIds.length) {
+  if (models.length !== requiredModelIds.length) {
     throw new HttpError(400, "One or more selected models are inactive or missing", "model_not_found");
+  }
+
+  const aliases = payload.aliases ?? [];
+  const normalizedAliases = aliases.map((alias) => alias.alias.trim().toLowerCase());
+  const uniqueAliases = new Set(normalizedAliases);
+
+  if (uniqueAliases.size !== normalizedAliases.length) {
+    throw new HttpError(400, "Package aliases must be unique", "duplicate_model_alias");
   }
 }
 

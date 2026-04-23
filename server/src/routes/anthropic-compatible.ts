@@ -1,24 +1,47 @@
-import { ErrorCategory, RequestStatus, Tier } from "@prisma/client";
-import type { Prisma } from "@prisma/client";
+import { Tier } from "@prisma/client";
 import { randomUUID } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
-import { prisma } from "../db.js";
 import { HttpError, sendError } from "../lib/http.js";
-import { estimateTextTokens } from "../lib/tokens.js";
-import { isTierAllowed } from "../lib/tiers.js";
-import type { GatewayPolicy, ModelConfigWithProvider } from "../types.js";
+import { logError, logInfo, stringifyForLog } from "../lib/logger.js";
+import { executeGatewayRequest } from "../services/gateway.js";
+import type { GatewayMessage, GatewayToolCall, GatewayToolDefinition } from "../types.js";
+
+const contentBlockSchema = z.object({
+  type: z.string(),
+  text: z.string().optional(),
+  id: z.string().optional(),
+  name: z.string().optional(),
+  input: z.unknown().optional(),
+  tool_use_id: z.string().optional(),
+  content: z.unknown().optional()
+}).passthrough();
 
 const anthropicMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z.union([z.string(), z.array(contentBlockSchema)])
+}).passthrough();
+
+const toolSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  input_schema: z.record(z.unknown()).optional()
+}).passthrough();
+
+const messagesRequestSchema = z.object({
   model: z.string().optional(),
   max_tokens: z.number().int().positive().default(1024),
-  messages: z.array(z.object({
-    role: z.enum(["user", "assistant"]),
-    content: z.unknown()
-  })).min(1),
-  system: z.unknown().optional(),
+  messages: z.array(anthropicMessageSchema).min(1),
+  system: z.union([z.string(), z.array(contentBlockSchema)]).optional(),
+  tools: z.array(toolSchema).optional(),
+  tool_choice: z.union([
+    z.object({ type: z.literal("auto") }).passthrough(),
+    z.object({ type: z.literal("tool"), name: z.string() }).passthrough()
+  ]).optional(),
   stream: z.boolean().optional()
 }).passthrough();
+
+const unsupportedAnthropicContentTypes = new Set(["thinking", "redacted_thinking"]);
 
 export const anthropicCompatibleRouter = Router();
 
@@ -28,131 +51,126 @@ anthropicCompatibleRouter.post("/messages", async (req, res) => {
       throw new HttpError(401, "Authentication required", "auth_required");
     }
 
-    const payload = anthropicMessageSchema.parse(req.body);
+    logInfo("anthropic", "request body received", {
+      userId: req.gateway.user.id,
+      body: stringifyForLog(req.body)
+    });
+
+    const payload = messagesRequestSchema.parse(req.body);
+    const sanitizedPayload = sanitizeAnthropicPayload(payload);
     const requestedTier = parseTierOverride(payload.model);
-    const selectedTier = requestedTier ?? Tier.L1;
-
-    if (!isTierAllowed(selectedTier, req.gateway.policy.maxTier)) {
-      throw new HttpError(403, `Requested tier ${selectedTier} exceeds allowed tier ${req.gateway.policy.maxTier}`, "tier_not_allowed");
-    }
-
-    if (req.gateway.policy.cacheEnabled) {
-      throw new HttpError(501, "Cache is enabled in policy but cache service is not configured", "cache_not_configured");
-    }
-
-    if (req.gateway.policy.ragEnabled) {
-      throw new HttpError(501, "RAG is enabled in policy but RAG service is not configured", "rag_not_configured");
-    }
-
-    const model = modelForTier(req.gateway.policy, selectedTier);
-
-    if (!model) {
-      throw new HttpError(400, `No model configured for tier ${selectedTier}`, "model_not_configured");
-    }
-
-    const promptText = serializeAnthropicPrompt(payload.messages as AnthropicPromptMessage[], payload.system);
-    const inputTokensEstimated = estimateTextTokens(promptText);
-
-    if (inputTokensEstimated > req.gateway.policy.maxInputTokens) {
-      await logAnthropicRequest({
-        userId: req.gateway.user.id,
-        status: RequestStatus.REJECTED,
-        requestedTier,
-        selectedTier,
-        selectedModel: model.modelName,
-        promptText,
-        inputTokensEstimated,
-        outputTokensLimit: payload.max_tokens,
-        errorCategory: ErrorCategory.TOKEN_LIMIT,
-        errorMessage: "Input token limit exceeded"
-      });
-      throw new HttpError(413, "Input token limit exceeded", "input_token_limit");
-    }
-
-    const maxTokens = Math.min(payload.max_tokens, req.gateway.policy.maxOutputTokens, model.maxOutputTokens);
-
-    if (inputTokensEstimated + maxTokens > model.maxContextTokens) {
-      throw new HttpError(413, `Context limit exceeded for model ${model.displayName}`, "context_limit");
-    }
-
-    const providerResponse = await callOpenRouterMessages({
-      model,
-      body: {
-        ...payload,
-        model: model.modelName,
-        max_tokens: maxTokens
+    const requestedModelAlias = payload.model && !requestedTier ? payload.model : undefined;
+    const result = await executeGatewayRequest({
+      userId: req.gateway.user.id,
+      policy: req.gateway.policy,
+      aliases: req.gateway.aliases,
+      clientProtocol: "anthropic_messages",
+      messages: toGatewayMessages(sanitizedPayload.system, sanitizedPayload.messages),
+      tools: sanitizedPayload.tools?.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.input_schema
+      })),
+      toolChoice: toGatewayToolChoice(sanitizedPayload.tool_choice),
+      stream: sanitizedPayload.stream,
+      requestedTier,
+      requestedModelAlias,
+      maxOutputTokens: sanitizedPayload.max_tokens,
+      metadata: {
+        incomingModel: payload.model,
+        adapterWarnings: buildAdapterWarnings(payload, sanitizedPayload)
       }
     });
 
-    if (!providerResponse.ok) {
-      const errorBody = await providerResponse.text();
-      await logAnthropicRequest({
-        userId: req.gateway.user.id,
-        status: RequestStatus.FAILED,
-        requestedTier,
-        selectedTier,
-        selectedModel: model.modelName,
-        promptText,
-        inputTokensEstimated,
-        outputTokensLimit: maxTokens,
-        errorCategory: ErrorCategory.PROVIDER,
-        errorMessage: errorBody || providerResponse.statusText
-      });
-      throw new HttpError(502, errorBody || providerResponse.statusText, "provider_failed");
-    }
+    logInfo("anthropic", "request received", {
+      userId: req.gateway.user.id,
+      requestedTier,
+      requestedModelAlias,
+      incomingModel: payload.model,
+      messageCount: payload.messages.length,
+      stream: payload.stream ?? false
+    });
+
+    const responseId = `msg_${randomUUID().replaceAll("-", "")}`;
+    const contentBlocks = toAnthropicContentBlocks(result.content, result.toolCalls);
+    const usage = {
+      input_tokens: result.providerInputTokens ?? result.inputTokensEstimated,
+      output_tokens: result.providerOutputTokens ?? 0
+    };
 
     if (payload.stream) {
-      await streamAnthropicResponse({
-        response: providerResponse,
-        res,
-        log: {
-          model,
-          userId: req.gateway.user.id,
-          requestedTier,
-          selectedTier,
-          selectedModel: model.modelName,
-          promptText,
-          inputTokensEstimated,
-          outputTokensLimit: maxTokens
+      res.setHeader("content-type", "text/event-stream; charset=utf-8");
+      res.setHeader("cache-control", "no-cache");
+      res.setHeader("connection", "keep-alive");
+
+      res.write(`event: message_start\ndata: ${JSON.stringify({
+        type: "message_start",
+        message: {
+          id: responseId,
+          type: "message",
+          role: "assistant",
+          model: result.selectedModel,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage
         }
+      })}\n\n`);
+
+      contentBlocks.forEach((block, index) => {
+        res.write(`event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index,
+          content_block: block
+        })}\n\n`);
+
+        if (block.type === "text") {
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index,
+            delta: {
+              type: "text_delta",
+              text: block.text
+            }
+          })}\n\n`);
+        }
+
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop",
+          index
+        })}\n\n`);
       });
+
+      res.write(`event: message_delta\ndata: ${JSON.stringify({
+        type: "message_delta",
+        delta: {
+          stop_reason: result.toolCalls?.length ? "tool_use" : "end_turn",
+          stop_sequence: null
+        },
+        usage
+      })}\n\n`);
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      res.end();
       return;
     }
 
-    const body = await providerResponse.json() as {
-      id?: string;
-      model?: string;
-      usage?: AnthropicUsage;
-    };
-
-    await logAnthropicRequest({
-      userId: req.gateway.user.id,
-      status: RequestStatus.SUCCESS,
-      requestedTier,
-      selectedTier,
-      selectedModel: body.model ?? model.modelName,
-      promptText,
-      inputTokensEstimated,
-      outputTokensLimit: maxTokens,
-      providerInputTokens: body.usage?.input_tokens,
-      providerOutputTokens: body.usage?.output_tokens,
-      providerTotalTokens: sumAnthropicUsage(body.usage),
-      providerCachedTokens: body.usage?.cache_read_input_tokens,
-      providerCost: estimateProviderCost({
-        model,
-        inputTokens: body.usage?.input_tokens ?? inputTokensEstimated,
-        outputTokens: body.usage?.output_tokens ?? 0
-      }),
-      providerRawUsage: body.usage,
-      errorCategory: ErrorCategory.NONE
-    });
-
     res.json({
-      id: body.id ?? `msg_${randomUUID().replaceAll("-", "")}`,
-      ...body,
-      model: body.model ?? model.modelName
+      id: responseId,
+      type: "message",
+      role: "assistant",
+      model: result.selectedModel,
+      content: contentBlocks,
+      stop_reason: result.toolCalls?.length ? "tool_use" : "end_turn",
+      stop_sequence: null,
+      usage
     });
   } catch (error) {
+    logError("anthropic", "request errored", {
+      path: req.originalUrl,
+      userId: req.gateway?.user.id,
+      error: error instanceof Error ? error.message : "Unknown error"
+    });
+
     if (error instanceof z.ZodError) {
       sendError(res, new HttpError(400, error.message, "invalid_messages_request"));
       return;
@@ -162,170 +180,6 @@ anthropicCompatibleRouter.post("/messages", async (req, res) => {
   }
 });
 
-interface AnthropicUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-  [key: string]: unknown;
-}
-
-interface AnthropicPromptMessage {
-  role: string;
-  content: unknown;
-}
-
-async function callOpenRouterMessages(input: { model: ModelConfigWithProvider; body: Record<string, unknown> }): Promise<Response> {
-  const provider = input.model.provider;
-  const apiKey = process.env[provider.apiKeyEnvVar];
-
-  if (!apiKey) {
-    throw new HttpError(500, `Missing provider API key environment variable: ${provider.apiKeyEnvVar}`, "provider_key_missing");
-  }
-
-  return fetch(`${provider.baseUrl.replace(/\/$/, "")}/messages`, {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${apiKey}`,
-      "content-type": "application/json",
-      "anthropic-version": "2023-06-01",
-      "http-referer": process.env.OPENROUTER_HTTP_REFERER ?? "http://localhost:3000",
-      "x-title": process.env.OPENROUTER_APP_TITLE ?? "LLM Gateway"
-    },
-    body: JSON.stringify(input.body)
-  });
-}
-
-async function streamAnthropicResponse(input: {
-  response: Response;
-  res: import("express").Response;
-  log: Omit<LogInput, "status" | "errorCategory"> & { model: ModelConfigWithProvider };
-}): Promise<void> {
-  input.res.setHeader("content-type", input.response.headers.get("content-type") ?? "text/event-stream; charset=utf-8");
-  input.res.setHeader("cache-control", "no-cache");
-  input.res.setHeader("connection", "keep-alive");
-
-  const reader = input.response.body?.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let buffered = "";
-  let usage: AnthropicUsage | undefined;
-
-  if (!reader) {
-    input.res.end();
-    return;
-  }
-
-  while (true) {
-    const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
-
-    const chunk = decoder.decode(value, { stream: true });
-    buffered += chunk;
-    input.res.write(encoder.encode(chunk));
-  }
-
-  usage = extractLastUsageFromSse(buffered);
-
-  await logAnthropicRequest({
-    ...input.log,
-    status: RequestStatus.SUCCESS,
-    providerInputTokens: usage?.input_tokens,
-    providerOutputTokens: usage?.output_tokens,
-    providerTotalTokens: sumAnthropicUsage(usage),
-    providerCachedTokens: usage?.cache_read_input_tokens,
-    providerCost: estimateProviderCost({
-      model: input.log.model,
-      inputTokens: usage?.input_tokens ?? input.log.inputTokensEstimated,
-      outputTokens: usage?.output_tokens ?? 0
-    }),
-    providerRawUsage: usage,
-    errorCategory: ErrorCategory.NONE
-  });
-
-  input.res.end();
-}
-
-function extractLastUsageFromSse(buffered: string): AnthropicUsage | undefined {
-  let usage: AnthropicUsage | undefined;
-
-  for (const line of buffered.split(/\r?\n/)) {
-    if (!line.startsWith("data: ")) {
-      continue;
-    }
-
-    const data = line.slice("data: ".length);
-
-    if (data === "[DONE]") {
-      continue;
-    }
-
-    try {
-      const parsed = JSON.parse(data) as { usage?: AnthropicUsage };
-
-      if (parsed.usage) {
-        usage = parsed.usage;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return usage;
-}
-
-interface LogInput {
-  userId: string;
-  status: RequestStatus;
-  requestedTier?: Tier;
-  selectedTier?: Tier;
-  selectedModel?: string;
-  promptText: string;
-  inputTokensEstimated: number;
-  outputTokensLimit: number;
-  providerInputTokens?: number;
-  providerOutputTokens?: number;
-  providerTotalTokens?: number;
-  providerCachedTokens?: number;
-  providerCost?: number;
-  providerRawUsage?: AnthropicUsage;
-  errorCategory: ErrorCategory;
-  errorMessage?: string;
-}
-
-async function logAnthropicRequest(input: LogInput): Promise<void> {
-  await prisma.requestLog.create({
-    data: {
-      userId: input.userId,
-      status: input.status,
-      requestedTier: input.requestedTier,
-      selectedTier: input.selectedTier,
-      selectedModel: input.selectedModel,
-      promptText: input.promptText,
-      promptPreview: input.promptText.slice(0, 300),
-      inputTokensEstimated: input.inputTokensEstimated,
-      outputTokensLimit: input.outputTokensLimit,
-      providerInputTokens: input.providerInputTokens,
-      providerOutputTokens: input.providerOutputTokens,
-      providerTotalTokens: input.providerTotalTokens,
-      providerCachedTokens: input.providerCachedTokens,
-      providerCost: input.providerCost,
-      providerRawUsage: toPrismaJson(input.providerRawUsage),
-      errorCategory: input.errorCategory,
-      errorMessage: input.errorMessage
-    }
-  });
-}
-
-function modelForTier(policy: GatewayPolicy, tier: Tier): ModelConfigWithProvider | null {
-  if (tier === Tier.L1) return policy.l1Model;
-  if (tier === Tier.L2) return policy.l2Model;
-  return policy.l3Model;
-}
-
 function parseTierOverride(model?: string): Tier | undefined {
   if (model === Tier.L1 || model === Tier.L2 || model === Tier.L3) {
     return model;
@@ -334,53 +188,194 @@ function parseTierOverride(model?: string): Tier | undefined {
   return undefined;
 }
 
-function serializeAnthropicPrompt(messages: Array<{ role: string; content: unknown }>, system: unknown): string {
-  const systemText = system ? `system: ${stringifyContent(system)}\n\n` : "";
-  return `${systemText}${messages.map((message) => `${message.role}: ${stringifyContent(message.content)}`).join("\n\n")}`;
+function sanitizeAnthropicPayload(
+  payload: z.infer<typeof messagesRequestSchema>
+): z.infer<typeof messagesRequestSchema> {
+  const nextPayload = {
+    ...payload,
+    system: sanitizeAnthropicContent(payload.system),
+    messages: payload.messages.map((message) => ({
+      ...message,
+      content: sanitizeAnthropicContent(message.content)
+    }))
+  } as z.infer<typeof messagesRequestSchema> & { thinking?: unknown };
+
+  if ("thinking" in nextPayload) {
+    delete nextPayload.thinking;
+  }
+
+  return nextPayload;
 }
 
-function stringifyContent(content: unknown): string {
+function sanitizeAnthropicContent(
+  content: string | Array<Record<string, unknown>> | undefined
+): string | Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+
+  const blocks = content
+    .map((block) => sanitizeAnthropicBlock(block))
+    .filter((block): block is Record<string, unknown> => block !== null);
+
+  if (!blocks.length) {
+    return "";
+  }
+
+  return blocks;
+}
+
+function sanitizeAnthropicBlock(block: Record<string, unknown>): Record<string, unknown> | null {
+  const type = typeof block.type === "string" ? block.type : "";
+
+  if (unsupportedAnthropicContentTypes.has(type)) {
+    return null;
+  }
+
+  if ((type === "tool_result" || type === "document") && "content" in block) {
+    return {
+      ...block,
+      content: sanitizeAnthropicContent(block.content as string | Array<Record<string, unknown>> | undefined)
+    };
+  }
+
+  return block;
+}
+
+function toGatewayMessages(
+  system: string | Array<Record<string, unknown>> | undefined,
+  messages: Array<z.infer<typeof anthropicMessageSchema>>
+): GatewayMessage[] {
+  const gatewayMessages: GatewayMessage[] = [];
+
+  if (system) {
+    gatewayMessages.push({
+      role: "system",
+      content: normalizeAnthropicContent(system)
+    });
+  }
+
+  for (const message of messages) {
+    gatewayMessages.push(...gatewayMessagesFromAnthropicMessage(message));
+  }
+
+  return gatewayMessages;
+}
+
+function gatewayMessagesFromAnthropicMessage(
+  message: z.infer<typeof anthropicMessageSchema>
+): GatewayMessage[] {
+  if (typeof message.content === "string") {
+    return [{
+      role: message.role,
+      content: message.content
+    }];
+  }
+
+  const textParts = message.content
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text ?? "")
+    .join("");
+  const toolCalls = message.role === "assistant"
+    ? message.content
+      .filter((block) => block.type === "tool_use")
+      .map((block) => ({
+        id: block.id ?? `call_${randomUUID().replaceAll("-", "")}`,
+        name: block.name ?? "tool",
+        arguments: JSON.stringify(block.input ?? {})
+      }))
+    : undefined;
+  const toolResults = message.role === "user"
+    ? message.content
+      .filter((block) => block.type === "tool_result")
+      .map((block) => ({
+        role: "tool" as const,
+        content: normalizeAnthropicContent(block.content),
+        toolCallId: block.tool_use_id
+      }))
+    : [];
+
+  const normalized: GatewayMessage[] = [{
+    role: message.role,
+    content: textParts,
+    toolCalls
+  }];
+
+  return [...normalized, ...toolResults];
+}
+
+function normalizeAnthropicContent(content: unknown): string {
   if (typeof content === "string") {
     return content;
   }
 
-  return JSON.stringify(content);
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((block) => typeof block === "object" && block !== null && "text" in block && typeof block.text === "string")
+    .map((block) => String(block.text))
+    .join("");
 }
 
-function sumAnthropicUsage(usage?: AnthropicUsage): number | undefined {
-  if (!usage) {
+function toGatewayToolChoice(
+  toolChoice?: z.infer<typeof messagesRequestSchema>["tool_choice"]
+): "auto" | "none" | { name: string } | undefined {
+  if (!toolChoice) {
     return undefined;
   }
 
-  return (usage.input_tokens ?? 0)
-    + (usage.output_tokens ?? 0)
-    + (usage.cache_creation_input_tokens ?? 0)
-    + (usage.cache_read_input_tokens ?? 0);
+  if (toolChoice.type === "tool") {
+    return { name: toolChoice.name };
+  }
+
+  return "auto";
 }
 
-function estimateProviderCost(input: {
-  model: ModelConfigWithProvider;
-  inputTokens: number;
-  outputTokens: number;
-}): number | undefined {
-  if (!input.model.inputCostPer1M || !input.model.outputCostPer1M) {
-    return undefined;
+function buildAdapterWarnings(
+  original: z.infer<typeof messagesRequestSchema>,
+  sanitized: z.infer<typeof messagesRequestSchema>
+): string[] {
+  const warnings: string[] = [];
+
+  if ("thinking" in original) {
+    warnings.push("Removed unsupported Anthropic thinking field");
   }
 
-  const inputCost = Number(input.model.inputCostPer1M);
-  const outputCost = Number(input.model.outputCostPer1M);
-
-  if (!Number.isFinite(inputCost) || !Number.isFinite(outputCost)) {
-    return undefined;
+  if (JSON.stringify(original.messages) !== JSON.stringify(sanitized.messages)) {
+    warnings.push("Removed unsupported Anthropic content blocks");
   }
 
-  return ((input.inputTokens / 1_000_000) * inputCost) + ((input.outputTokens / 1_000_000) * outputCost);
+  return warnings;
 }
 
-function toPrismaJson(value: unknown): Prisma.InputJsonValue | undefined {
-  if (value === undefined) {
-    return undefined;
+function toAnthropicContentBlocks(content: string, toolCalls?: GatewayToolCall[]) {
+  const blocks: Array<Record<string, unknown>> = [];
+
+  if (content) {
+    blocks.push({
+      type: "text",
+      text: content
+    });
   }
 
-  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+  if (toolCalls?.length) {
+    blocks.push(...toolCalls.map((toolCall) => ({
+      type: "tool_use",
+      id: toolCall.id,
+      name: toolCall.name,
+      input: safeJsonParse(toolCall.arguments)
+    })));
+  }
+
+  return blocks;
+}
+
+function safeJsonParse(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
 }

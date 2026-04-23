@@ -89,6 +89,10 @@ model ModelConfig {
   maxOutputTokens  Int
   inputCostPer1M   Decimal?          @db.Decimal(10, 4)
   outputCostPer1M  Decimal?          @db.Decimal(10, 4)
+  supportsOpenAIChat Boolean         @default(true)
+  supportsAnthropicMessages Boolean  @default(true)
+  supportsTools    Boolean           @default(true)
+  supportsStreaming Boolean          @default(true)
   active           Boolean           @default(true)
   l1Policies       UserModelPolicy[] @relation("PolicyL1Model")
   l2Policies       UserModelPolicy[] @relation("PolicyL2Model")
@@ -96,6 +100,7 @@ model ModelConfig {
   l1Packages       Package[]         @relation("PackageL1Model")
   l2Packages       Package[]         @relation("PackageL2Model")
   l3Packages       Package[]         @relation("PackageL3Model")
+  exposedAliases   PackageModelAlias[]
   requestLogs      RequestLog[]
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
@@ -138,9 +143,26 @@ model Package {
   l2Model         ModelConfig? @relation("PackageL2Model", fields: [l2ModelId], references: [id])
   l3ModelId       String?
   l3Model         ModelConfig? @relation("PackageL3Model", fields: [l3ModelId], references: [id])
+  aliases         PackageModelAlias[]
   users           User[]
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
+}
+
+model PackageModelAlias {
+  id              String      @id @default(cuid())
+  packageId        String
+  package          Package     @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  alias            String
+  modelConfigId    String
+  modelConfig      ModelConfig @relation(fields: [modelConfigId], references: [id], onDelete: Cascade)
+  enableOpenAI     Boolean     @default(true)
+  enableAnthropic  Boolean     @default(true)
+  active           Boolean     @default(true)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  @@unique([packageId, alias])
 }
 
 model UserModelPolicy {
@@ -174,6 +196,16 @@ model RequestLog {
   requestedTier        Tier?
   selectedTier         Tier?
   selectedModel        String?
+  clientProtocol       String?
+  requestedModelAlias  String?
+  resolvedModelAlias   String?
+  resolvedConfiguredModelId String?
+  usedDefaultSlot      Boolean?
+  usedTierOverride     Boolean?
+  usedAliasOverride    Boolean?
+  requestedTools       Boolean?
+  streamRequested      Boolean?
+  adapterWarnings      Json?
   promptText           String?       @db.Text
   promptPreview        String?
   inputTokensEstimated Int           @default(0)

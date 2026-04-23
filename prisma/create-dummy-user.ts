@@ -15,33 +15,21 @@ async function main(): Promise<void> {
   const gatewayApiKey = process.env.DUMMY_GATEWAY_API_KEY ?? createGatewayApiKey();
   const packageName = process.env.DUMMY_PACKAGE_NAME ?? "Starter";
 
-  const models = await prisma.modelConfig.findMany({
-    where: {
-      active: true,
-      provider: {
-        name: "openrouter",
-        active: true
-      }
-    },
-    orderBy: {
-      tier: "asc"
-    }
-  });
-
-  const l1 = models.find((model) => model.tier === Tier.L1);
-  const l2 = models.find((model) => model.tier === Tier.L2);
-  const l3 = models.find((model) => model.tier === Tier.L3);
-
-  if (!l1) {
-    throw new Error("No active L1 model found. Run npm run prisma:seed first.");
-  }
-
   const pkg = await prisma.package.findUnique({
-    where: { name: packageName }
+    where: { name: packageName },
+    include: {
+      l1Model: true,
+      l2Model: true,
+      l3Model: true
+    }
   });
 
   if (!pkg) {
     throw new Error(`Package "${packageName}" was not found. Run npm run prisma:seed first.`);
+  }
+
+  if (!pkg.l1Model || !pkg.l1Model.active) {
+    throw new Error(`Package "${packageName}" does not have an active L1 model.`);
   }
 
   const user = await prisma.user.upsert({
@@ -72,9 +60,9 @@ async function main(): Promise<void> {
       truncateInput: readBoolEnv("DUMMY_TRUNCATE_INPUT", false),
       cacheEnabled: false,
       ragEnabled: false,
-      l1ModelId: l1.id,
-      l2ModelId: l2?.id,
-      l3ModelId: l3?.id
+      l1ModelId: pkg.l1ModelId,
+      l2ModelId: pkg.l2ModelId,
+      l3ModelId: pkg.l3ModelId
     },
     update: {
       maxTier,
@@ -84,9 +72,9 @@ async function main(): Promise<void> {
       truncateInput: readBoolEnv("DUMMY_TRUNCATE_INPUT", false),
       cacheEnabled: false,
       ragEnabled: false,
-      l1ModelId: l1.id,
-      l2ModelId: l2?.id,
-      l3ModelId: l3?.id
+      l1ModelId: pkg.l1ModelId,
+      l2ModelId: pkg.l2ModelId,
+      l3ModelId: pkg.l3ModelId
     }
   });
 

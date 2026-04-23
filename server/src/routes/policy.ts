@@ -32,7 +32,17 @@ policyRouter.get("/me/policy", (req, res) => {
             L1: summarizeModel(policy.l1Model),
             L2: policy.l2Model ? summarizeModel(policy.l2Model) : null,
             L3: policy.l3Model ? summarizeModel(policy.l3Model) : null
-          }
+          },
+          aliases: req.gateway.aliases.map((alias) => ({
+            id: alias.id,
+            alias: alias.alias,
+            modelConfigId: alias.modelConfigId,
+            modelDisplayName: alias.modelConfig.displayName,
+            modelName: alias.modelConfig.modelName,
+            enableOpenAI: alias.enableOpenAI,
+            enableAnthropic: alias.enableAnthropic,
+            active: alias.active
+          }))
         }
       }
     });
@@ -45,7 +55,6 @@ function summarizeModel(model: {
   id: string;
   displayName: string;
   modelName: string;
-  tier: string;
   maxContextTokens: number;
   maxOutputTokens: number;
   provider: { name: string; baseUrl: string; active: boolean };
@@ -54,7 +63,6 @@ function summarizeModel(model: {
     id: model.id,
     displayName: model.displayName,
     modelName: model.modelName,
-    tier: model.tier,
     maxContextTokens: model.maxContextTokens,
     maxOutputTokens: model.maxOutputTokens,
     provider: {

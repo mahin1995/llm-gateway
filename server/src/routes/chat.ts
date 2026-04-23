@@ -2,6 +2,7 @@ import { Tier } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import { HttpError, sendError } from "../lib/http.js";
+import { logInfo, stringifyForLog } from "../lib/logger.js";
 import { executeGatewayRequest } from "../services/gateway.js";
 
 const chatRequestSchema = z.object({
@@ -21,10 +22,17 @@ chatRouter.post("/chat", async (req, res) => {
       throw new HttpError(401, "Authentication required", "auth_required");
     }
 
+    logInfo("chat", "request body received", {
+      userId: req.gateway.user.id,
+      body: stringifyForLog(req.body)
+    });
+
     const payload = chatRequestSchema.parse(req.body);
     const result = await executeGatewayRequest({
       userId: req.gateway.user.id,
       policy: req.gateway.policy,
+      aliases: req.gateway.aliases,
+      clientProtocol: "openai_chat",
       messages: payload.messages,
       requestedTier: payload.requestedTier,
       maxOutputTokens: payload.maxOutputTokens
